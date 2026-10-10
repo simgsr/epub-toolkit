@@ -58,7 +58,7 @@ content:             ## prove no text was lost (needs the source bundle here)
 	$(PYTHON) content_check.py
 
 epubcheck:           ## one JSON report per book into $(REPORTS)/
-	@mkdir -p $(REPORTS); found=0; fail=0; \
+	@rm -rf $(REPORTS); mkdir -p $(REPORTS); found=0; fail=0; \
 	for f in $(SPLIT)/*.epub; do [ -e "$$f" ] || continue; found=1; \
 	  b=$$(basename "$$f" .epub); \
 	  echo "--- $$b"; \

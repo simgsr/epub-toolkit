@@ -168,6 +168,13 @@ BUNDLES = [
     # wrong cover waiting behind any work whose first page it fails to read.
     dict(key='cuimanli', match='崔曼莉', author='崔曼莉',
          set_title='崔曼莉小说集', embedded_cover=False),
+
+    # 铁凝长篇四部: four novels by 铁凝 in one converted file set -- 大浴女,
+    # 玫瑰门, 无雨之城, 笨花.  Like the entry above, its NCX is good enough on
+    # its own: four top-level navPoints, one per work, each a contiguous run of
+    # spine documents, so it needs neither `book_marks` nor `books_page`.
+    dict(key='tiening', match='铁凝', author='铁凝',
+         set_title='铁凝长篇四部', embedded_cover=False),
 ]
 
 

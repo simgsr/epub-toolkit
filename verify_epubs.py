@@ -63,7 +63,6 @@ class Report:
 
 def check(path):
     rep = Report(path)
-    name = os.path.basename(path)
 
     # ---- archive ---------------------------------------------------------
     with zipfile.ZipFile(path) as z:

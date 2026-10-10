@@ -52,7 +52,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from epub_paths import SPLIT, WEB_COVERS
-from split_epubs import BUNDLES, finalise_toc, rel_from, render_nav
+from split_epubs import BUNDLES, finalise_toc, render_nav
 
 NCX_NS = 'http://www.daisy.org/z3986/2005/ncx/'
 NS = {'n': NCX_NS}

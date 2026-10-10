@@ -566,9 +566,9 @@ def build_toc(bundle, entry, files):
         raw = bundle.text(toc_page)
         labels = re.findall(r'<a\b[^>]*href\s*=\s*"[^"]+"[^>]*>(.*?)</a>',
                             raw, re.I | re.S)
-        labels = [re.sub(r'\s+', ' ', re.sub(r'(?s)<[^>]+>', '', l)).strip()
-                  for l in labels]
-        labels = [l for l in labels if l]
+        labels = [re.sub(r'\s+', ' ', re.sub(r'(?s)<[^>]+>', '', label)).strip()
+                  for label in labels]
+        labels = [label for label in labels if label]
         out = []
         for i, href in enumerate(links):
             target = resolve(toc_page, href)

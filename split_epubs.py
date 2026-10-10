@@ -70,9 +70,10 @@ SCAN_CHAPTER = re.compile(r'^第[一二三四五六七八九十百零]+[章回]$
 SCAN_SECTION = re.compile(r'^[一二三四五六七八九十百零]+$')
 
 
-# Per-bundle configuration.  `embedded_cover` records whether the bundle really
-# carries a per-book cover image -- verified by eye, not inferred.  `books_page`
-# names the bundle's own 总目录 when the NCX cannot supply book boundaries.
+# Per-bundle configuration.  `embedded_cover` opts the bundle into the
+# largest-image cover rule, the only one that needs a flag; the reliable cover
+# rules run for every bundle (see attach_covers).  `books_page` names the
+# bundle's own 总目录 when the NCX cannot supply book boundaries.
 BUNDLES = [
     # ------------------------------------------------------------------
     # Per-bundle configuration -- one entry per multi-book bundle.  `match`
@@ -102,10 +103,13 @@ BUNDLES = [
     #   scan_book=dict(...)       a PDF-scan EPUB, the whole work being one
     #                             document of page images (see plan_scan_book)
     #
-    # `embedded_cover` records whether the bundle really carries a per-work
-    # cover image -- confirmed by eye, never inferred.  When it is False the
-    # books are written without a cover unless EPUB_WEB_COVERS names a
-    # directory of "<key>-<NN>.jpg" images (see epub_paths.web_covers).
+    # `embedded_cover= True` opts this bundle into the largest-image cover
+    # rule, which runs only when the reliable rules find nothing -- a first
+    # page that is bare image, or a page titled 封面 (see attach_covers).  It
+    # is confirmed by eye and never inferred, because it is the one rule that
+    # mis-binds interior plates.  With it False, a book that has no cover of
+    # its own is written without one unless EPUB_WEB_COVERS names a directory
+    # of "<key>-<NN>.jpg" images (see epub_paths.web_covers).
     # ------------------------------------------------------------------
 
     # 徐皓峰作品集: six works in one converted file set.  Its NCX is flat --
@@ -136,6 +140,34 @@ BUNDLES = [
              'text00017.html#filepos0003747219',      # 刀背藏身
          ],
          drop_tail_marker=['Table of Contents']),
+
+    # 崔曼莉小说集 (全4册): the ordinary case, and the contrast with the entry
+    # above.  Its NCX is good enough for the engine on its own -- four
+    # top-level navPoints, one per work, each a contiguous run of spine
+    # documents -- so it needs neither `book_marks` nor `books_page`.
+    #
+    # The NCX is real but NOT declared in the OPF manifest, a legacy EPUB 2
+    # defect; the splitter reads toc.ncx by path rather than through the
+    # manifest, so that costs nothing here.
+    #
+    # Note the four navPoints are not four volumes of one novel: 浮沉.1 and
+    # 浮沉.2 are two volumes of 浮沉, while 琉璃时代 and 卡卡的信仰 are
+    # separate works.  The engine maps top-level navPoints 1:1 to books, which
+    # is what "全4册" describes.
+    #
+    # embedded_cover=False, and the covers still come out right: every work
+    # opens on its own printed cover, so the first-page rule binds it with no
+    # flag needed.  The four picks are images/00001 (浮沉①), 00009 (浮沉②),
+    # 00014 (琉璃时代) and 00028 (卡卡的信仰), each a real ~544x751
+    # publisher's flat front cover, and all four were opened and looked at.
+    #
+    # The largest-image rule is left OFF deliberately.  On this bundle it
+    # disagrees with the first-page rule for 琉璃时代, voting for
+    # images/00022 -- an interior plate.  It only appears to work here because
+    # the first-page rule runs first and wins; enabling it would leave a
+    # wrong cover waiting behind any work whose first page it fails to read.
+    dict(key='cuimanli', match='崔曼莉', author='崔曼莉',
+         set_title='崔曼莉小说集', embedded_cover=False),
 ]
 
 
@@ -2007,12 +2039,16 @@ def attach_covers(bundle, books):
                 j = bundle.preceding_cover(start)
                 if j is not None:
                     cover_archive = page_image(bundle, bundle.spine[j])
-        elif bundle.cfg['embedded_cover']:
-            # The page the book opens on is its printed cover when that page
-            # is one (史景迁, 刘醒龙, 阿来); otherwise the designer's 封面 page
-            # if the range holds one (小川洋子, 江户川乱步).  The largest-image
-            # heuristic runs only where neither exists, since it binds interior
-            # plates -- a table, a map, a photograph (史景迁, 刘醒龙, 阿来).
+        else:
+            # These run for every bundle that does not set
+            # `cover_precedes_book` -- there is no flag to set.  A book that
+            # opens on a page holding nothing but an image, or on a page
+            # titled 封面, is opening on its own printed cover (史景迁,
+            # 刘醒龙, 阿来, 小川洋子, 江户川乱步), and binding that image
+            # cannot mistake an interior plate for a cover.  `embedded_cover`
+            # deliberately does not gate this: it used to, so a bundle whose
+            # works all open on their own covers was written with none at all
+            # until someone found the flag and set it by hand.
             cover_archive = first_page_cover(bundle, book['files'])
             if bundle.cfg.get('cover_pair'):
                 cover_archive = (cover_pair_front(bundle, book['files'])
@@ -2020,7 +2056,13 @@ def attach_covers(bundle, books):
             page = bundle.cfg.get('cover_page')
             if cover_archive is None and page:
                 cover_archive = cover_page_image(bundle, book['files'], page)
-            if cover_archive is None and not page:
+            # The largest-image rule is the one that gets covers wrong -- it
+            # binds interior plates, and handed a statistics table, a map, a
+            # photograph and a bibliography page to nine of 史景迁's twelve
+            # volumes -- so it stays opt-in, for a bundle whose works carry
+            # covers the rules above cannot find.
+            if (cover_archive is None and not page
+                    and bundle.cfg['embedded_cover']):
                 cover_archive = pick_embedded_cover(bundle, book['files'])
         # A by-eye pick beats the heuristic.  "Largest portrait image" lands on
         # an interior map (上杉谦信) or a statistics table (丈夫这东西) for some

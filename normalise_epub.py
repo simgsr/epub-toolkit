@@ -11,6 +11,9 @@ Repairs -- the defects a Sony/epubBuilder-era EPUB 2 is rejected for:
   * unique-identifier="PrimaryID" points at a dc:identifier that carries
     neither that id nor a value;
   * the non-standard <dc:builder> / <dc:builder_version> sit in metadata;
+  * EPUB 2's per-element `opf:role` / `opf:file-as` / `opf:scheme` still hang off
+    the Dublin Core elements, which EPUB 3 forbids -- Calibre writes all three,
+    and epubcheck rejects each one;
   * a stylesheet is declared twice in the manifest;
   * images the chapters link to are missing from the manifest;
   * the stylesheet pulls device fonts through res:// URLs;
@@ -24,6 +27,9 @@ Upgrade to EPUB 3:
   * a nav.xhtml built from the book's own NCX outline, declared
     properties="nav" (the NCX is kept for 2.x compatibility);
   * the cover declared properties="cover-image";
+  * properties="svg" on a content document that carries inline SVG;
+  * the NCX's identity reconciled with the package's -- the package's own
+    dc:identifier wins, and an NCX that already agrees is left alone;
   * every content document put through the splitter's own `normalise_html`,
     which is what makes an EPUB-2-era document valid EPUB 3 without touching
     the words.
@@ -193,7 +199,74 @@ def cover_href(s, opf_dir, kept):
     return None
 
 
-def upgrade_opf(s, urn, opf_dir, referenced, names, lang, cover):
+OPF2_ATTR = re.compile(r'\s+opf:(file-as|role|scheme)="([^"]*)"')
+DC_OPEN = re.compile(r'<dc:([\w-]+)\b([^>]*?)(/?)>', re.I)
+
+
+def demote_opf2_attributes(s):
+    """EPUB 2's per-element opf:* attributes -> EPUB 3 <meta refines=...>.
+
+    EPUB 2 hung `opf:role`, `opf:file-as` and `opf:scheme` off the Dublin Core
+    elements themselves.  EPUB 3 allows none of them: the first two become
+    <meta> elements refining the element they sat on, which therefore has to
+    gain an id, and `opf:scheme` is dropped outright, there being nowhere in
+    EPUB 3 to record a scheme for a plain-string identifier.  A Calibre-made
+    book carries four of these, which is five epubcheck RSC-005 errors -- one
+    creator element carries two.
+
+    Returns (text, reasons).
+    """
+    refines = []
+    named = [0]
+
+    def convert(m):
+        tag, attrs, selfclose = m.group(1), m.group(2), m.group(3)
+        found = OPF2_ATTR.findall(attrs)
+        if not found:
+            return m.group(0)
+        attrs = OPF2_ATTR.sub('', attrs)
+        idm = re.search(r'\bid="([^"]*)"', attrs)
+        if idm:
+            ident = idm.group(1)
+        else:
+            named[0] += 1
+            ident = f'opf2-{tag}-{named[0]}'
+            attrs = attrs.rstrip() + f' id="{ident}"'
+        for name, value in found:
+            if name == 'scheme':
+                continue
+            if name == 'role':
+                refines.append(f'    <meta refines="#{ident}" '
+                               f'property="role" scheme="marc:relators"'
+                               f'>{value}</meta>')
+            else:
+                refines.append(f'    <meta refines="#{ident}" '
+                               f'property="file-as">{value}</meta>')
+        return f'<dc:{tag}{attrs}{selfclose}>'
+
+    out = DC_OPEN.sub(convert, s)
+    if not refines:
+        return s, []
+    out = re.sub(r'(</metadata\s*>)',
+                 lambda m: '\n'.join(refines) + '\n' + m.group(1),
+                 out, count=1)
+    return out, ['EPUB 2 opf: attribute(s) moved into <meta refines>']
+
+
+def package_identifier(opf_text):
+    """The value of the dc:identifier that package/@unique-identifier names."""
+    ref = re.search(r'<package\b[^>]*\bunique-identifier\s*=\s*"([^"]+)"',
+                    opf_text)
+    if not ref:
+        return None
+    m = re.search(r'<dc:identifier\b[^>]*\bid\s*=\s*"' +
+                  re.escape(ref.group(1)) + r'"[^>]*>\s*([^<]*?)\s*<',
+                  opf_text)
+    return m.group(1) if m else None
+
+
+def upgrade_opf(s, urn, opf_dir, referenced, names, lang, cover,
+                svg_docs=frozenset()):
     """Repair the package and move it to EPUB 3.  Returns (text, reasons)."""
     reasons = []
 
@@ -211,6 +284,9 @@ def upgrade_opf(s, urn, opf_dir, referenced, names, lang, cover):
         s = re.sub(r'<dc:builder(?:_version)?\b[^>]*>.*?</dc:builder(?:_version)?>\s*',
                    '', s, flags=re.S)
         reasons.append('non-standard <dc:builder> removed')
+
+    s, opf2_reasons = demote_opf2_attributes(s)
+    reasons += opf2_reasons
 
     # a unique-identifier must resolve to a dc:identifier that has a value
     uid_ref = re.search(r'<package\b[^>]*\bunique-identifier\s*=\s*"([^"]+)"', s)
@@ -265,6 +341,18 @@ def upgrade_opf(s, urn, opf_dir, referenced, names, lang, cover):
         ext = posixpath.splitext(target)[1].lower()
         kept.append({'id': f'res-{n}', 'href': posixpath.relpath(target, opf_dir),
                      'media-type': MEDIA.get(ext, 'application/octet-stream')})
+
+    # A content document carrying inline SVG has to say so in the manifest, or
+    # epubcheck raises OPF-014 against the document.
+    svg_bare = [a for a in kept
+                if posixpath.normpath(posixpath.join(opf_dir, a['href']))
+                in svg_docs
+                and 'svg' not in (a.get('properties') or '').split()]
+    if svg_bare:
+        for a in svg_bare:
+            a['properties'] = (a.get('properties', '') + ' svg').strip()
+        reasons.append(f'{len(svg_bare)} document(s) use SVG but did not '
+                        f'declare properties="svg"')
 
     # the cover must be declared the EPUB 3 way
     if cover is not None:
@@ -350,10 +438,17 @@ def repair_css(raw):
     return FONT_FACE.sub('', raw.decode('utf-8')).encode('utf-8')
 
 
-def repair_ncx(raw, urn):
-    """Point the NCX identity at the package identity."""
-    return NCX_UID.sub(lambda m: m.group(1) + urn + m.group(2),
-                       raw.decode('utf-8')).encode('utf-8')
+def repair_ncx(raw, ident):
+    """Point the NCX identity at the package identity.
+
+    Left alone when the NCX names no identity at all: there is nothing to
+    reconcile, and inventing one would be a change the caller did not ask for.
+    """
+    text = raw.decode('utf-8')
+    if not NCX_UID.search(text):
+        return raw
+    return NCX_UID.sub(lambda m: m.group(1) + ident + m.group(2),
+                       text).encode('utf-8')
 
 
 # --------------------------------------------------------------------------
@@ -373,6 +468,10 @@ def analyse(src, cover_bytes=None, cover_name=None):
         raise ValueError('empty archive')
     names = [n for _i, n, _d in entries]
     nameset = set(names)
+    # content documents carrying inline SVG, which the manifest must declare
+    svg_docs = {n for _i, n, d in entries
+                if n.lower().endswith(('.html', '.xhtml', '.htm'))
+                and b'<svg' in d.lower()}
     opf_name = next((n for n in names if n.endswith('.opf')), None)
     if opf_name is None:
         raise ValueError('no package document')
@@ -398,8 +497,14 @@ def analyse(src, cover_bytes=None, cover_name=None):
         cover = posixpath.join(opf_dir, cover_name)
 
     new_opf, opf_reasons = upgrade_opf(raw_opf, urn, opf_dir, targets_in(entries),
-                                       nameset, lang, cover)
+                                       nameset, lang, cover, svg_docs)
     reasons += opf_reasons
+
+    # The NCX has to carry the package's own identity; an NCX still naming a
+    # different uuid is epubcheck NCX-001.  The package's identifier is the one
+    # that counts, so read it back off the repaired OPF rather than stamping
+    # the generated urn over both sides.
+    ident = package_identifier(new_opf) or urn
 
     ncx_name = next((n for n in names if n.lower().endswith('.ncx')), None)
     ncx_dir = posixpath.dirname(ncx_name) if ncx_name else opf_dir
@@ -414,7 +519,11 @@ def analyse(src, cover_bytes=None, cover_name=None):
                 reasons.append('device fonts (res://) in the stylesheet')
             patched[name] = fixed
         elif name.lower().endswith('.ncx'):
-            patched[name] = repair_ncx(data, urn)
+            fixed = repair_ncx(data, ident)
+            if fixed != data:
+                reasons.append('NCX identifier did not match the package '
+                               'identifier')
+            patched[name] = fixed
         elif name.lower().endswith(('.html', '.xhtml', '.htm')):
             fixed = normalise_html(repair_markup(data), name, nameset)
             patched[name] = fixed

@@ -1,0 +1,12 @@
+# Books.  The toolkit runs against EPUBs you already own, and the books
+# themselves are yours -- not the repository's.  This covers both the source
+# bundles dropped in the project root and the finished books written to split/.
+*.epub
+
+# Output of `make epubcheck` / `make check`.
+epubcheck-out/
+
+# Caches and macOS noise.  `make clean` removes these too.
+__pycache__/
+*.py[cod]
+.DS_Store

@@ -1100,6 +1100,47 @@ def drop_legacy_attrs(blob):
                    raw).encode('utf-8')
 
 
+# HTML only defines `data-*` when the name after the hyphen is non-empty and
+# carries no ASCII capital.  A Kindle-made book leaves `data-AmznRemoved` and
+# `data-AmznRemoved-M8` behind, which epubcheck rejects as HTM_061.
+DATA_ATTR = re.compile(
+    r'''(?i)\s*data-([^\s=>/]*)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)''')
+DATA_UPPER = re.compile(r'[A-Z]')
+
+
+def drop_invalid_data_attrs(blob):
+    """Delete a data-* attribute that is not a legal custom data attribute."""
+    try:
+        raw = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        return blob
+
+    def fix_tag(m):
+        return DATA_ATTR.sub(
+            lambda a: '' if not a.group(1) or DATA_UPPER.search(a.group(1))
+            else a.group(0), m.group(0))
+
+    return TAG.sub(fix_tag, raw).encode('utf-8')
+
+
+def invalid_data_attrs(blob):
+    """The names of the data-* attributes HTML does not define.
+
+    The read-only twin of drop_invalid_data_attrs, for a caller that has to
+    report the repair before making it.
+    """
+    try:
+        raw = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        return []
+    bad = []
+    for tag in TAG.finditer(raw):
+        for a in DATA_ATTR.finditer(tag.group(0)):
+            if not a.group(1) or DATA_UPPER.search(a.group(1)):
+                bad.append(a.group(0).split('=')[0].strip())
+    return bad
+
+
 # --- EPUB 2 markup the 金庸 bundles carry --------------------------------
 #
 # Those two bundles were converted from print by a tool that emitted HTML 4
@@ -1466,6 +1507,7 @@ def normalise_html(blob, path, keep):
     blob = demote_valign(blob)
     blob = drop_li_value(blob)
     blob = drop_legacy_attrs(blob)
+    blob = drop_invalid_data_attrs(blob)
     return blob
 
 
@@ -1521,10 +1563,17 @@ def drop_external_links(blob, base, keep):
 CSS_URL = re.compile(r'(?is)url\(\s*[\'"]?([^\'")]+)[\'"]?\s*\)')
 CSS_IMPORT = re.compile(
     r'''(?is)@import\s+(?:url\(\s*)?['"]?([^'");\s]+)['"]?\s*[^;]*;''')
+# a url() with the comma that joins it to the rest of a src list, on either
+# side -- dropping a dead source has to take one comma with it
+CSS_URL_AFTER_COMMA = re.compile(
+    r'(?is)\s*,\s*url\(\s*[\'"]?([^\'")]+)[\'"]?\s*\)')
+CSS_URL_BEFORE_COMMA = re.compile(
+    r'(?is)url\(\s*[\'"]?([^\'")]+)[\'"]?\s*\)\s*,\s*')
+CSS_SOURCE = re.compile(r'(?i)\b(?:local|url)\s*\(')
 STYLE_BLOCK = re.compile(r'(?is)(<style\b[^>]*>)(.*?)(</style\s*>)')
 
 
-def fix_dead_css(raw, base, keep):
+def fix_dead_css(raw, base, keep, keep_local_fonts=False):
     """Remove or neutralise every CSS reference this book does not carry.
 
     Three shapes, all of them dead in the source as well as here (RSC-007):
@@ -1538,17 +1587,35 @@ def fix_dead_css(raw, base, keep):
       from a background declaration.  "none" is CSS's own word for "no image",
       so the declaration keeps its meaning and the reader loses nothing that
       was ever going to arrive.
+
+    `keep_local_fonts` changes only the first shape.  A rule that lists device
+    fonts through local() and only then reaches for a file the book lacks does
+    have something to fall back on, so the dead source is pruned and the rule
+    kept; it is deleted only once nothing is left to declare.  The bundles'
+    placeholder sources, which have nothing behind them, keep the whole-rule
+    treatment.
     """
-    def font_face(m):
+    def dead(href):
+        if href.startswith('res:'):          # device font, never in a book
+            return True
+        return not ABSOLUTE.match(href) and resolve(base, href) not in keep
+
+    def whole_rule(m):
         block = m.group(0)
-        for href in CSS_URL.findall(block):
-            if href.startswith('res:'):          # device font, never in a book
-                return ''
-            if ABSOLUTE.match(href) or href.startswith('data:'):
-                continue
-            if resolve(base, href) not in keep:
-                return ''
-        return block
+        return '' if any(dead(href) for href in CSS_URL.findall(block)) else block
+
+    def prune_rule(m):
+        block = m.group(0)
+        if not any(dead(href) for href in CSS_URL.findall(block)):
+            return block
+
+        def drop(u):
+            return '' if dead(u.group(1)) else u.group(0)
+
+        block = CSS_URL_AFTER_COMMA.sub(drop, block)
+        block = CSS_URL_BEFORE_COMMA.sub(drop, block)
+        block = CSS_URL.sub(drop, block)
+        return block if CSS_SOURCE.search(block) else ''
 
     def import_rule(m):
         href = m.group(1)
@@ -1562,7 +1629,7 @@ def fix_dead_css(raw, base, keep):
             return m.group(0)
         return m.group(0) if resolve(base, href) in keep else 'none'
 
-    raw = FONT_FACE.sub(font_face, raw)
+    raw = FONT_FACE.sub(prune_rule if keep_local_fonts else whole_rule, raw)
     raw = CSS_IMPORT.sub(import_rule, raw)
     return CSS_URL.sub(one_url, raw)
 

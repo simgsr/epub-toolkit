@@ -17,6 +17,19 @@ Repairs -- the defects a Sony/epubBuilder-era EPUB 2 is rejected for:
   * a stylesheet is declared twice in the manifest;
   * images the chapters link to are missing from the manifest;
   * the stylesheet pulls device fonts through res:// URLs;
+  * the stylesheet also reaches for font files the book does not carry -- that
+    one src goes, and the rule's local() fallbacks are kept, so a reader that
+    has the device font still matches it;
+  * a <title> with nothing in it -- RSC-005, and every page of an epubBuilder
+    book has one.  The document's own <h1> names the page, and the package's
+    dc:title covers the pages that have no heading;
+  * a data-* attribute HTML does not define, which a Kindle-made book leaves on
+    its landmarks nav;
+  * a `properties` token EPUB 3 does not define, on a manifest item or on a
+    spine <itemref> -- a Duokan book tags two of the latter
+    properties="duokan-page-fullscreen";
+  * an NCX whose playOrder disagrees between navPoints naming the same target,
+    or leaves gaps in the sequence;
   * mimetype ends in CRLF instead of the bare media type;
   * image names are stored as GBK bytes with no UTF-8 flag, so epubcheck cannot
     open the archive at all.
@@ -35,8 +48,9 @@ Upgrade to EPUB 3:
     the words.
 
 A cover is never required: a book with none is written without one and noted
-NO-COVER.  A file that is already a conformant EPUB 3 is reported OK and
-copied through unchanged, so this is safe to run repeatedly.
+NO-COVER.  A file that is already a conformant EPUB 3 *and* free of the repairs
+above is reported OK and copied through unchanged, so this is safe to run
+repeatedly.
 
 Usage:
     python3 normalise_epub.py               # top-level EPUBs + everything in split/
@@ -56,9 +70,11 @@ import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
+from xml.sax.saxutils import escape
 
 from epub_paths import SPLIT, WEB_COVERS
-from split_epubs import BUNDLES, finalise_toc, render_nav
+from split_epubs import (BUNDLES, finalise_toc, fix_dead_css,
+                         invalid_data_attrs, render_nav)
 
 NCX_NS = 'http://www.daisy.org/z3986/2005/ncx/'
 NS = {'n': NCX_NS}
@@ -75,9 +91,27 @@ ATTR = re.compile(r'([\w:-]+)="([^"]*)"')
 IMG_SRC = re.compile(r'<img\b[^>]*?src="([^"]+)"', re.I)
 IMG_TAG = re.compile(r'<img\b[^>]*?>', re.I)
 ALT_ATTR = re.compile(r'\balt\s*=', re.I)
-FONT_FACE = re.compile(r'@font-face\s*\{[^}]*res://[^}]*\}\s*', re.I)
 NCX_UID = re.compile(r'(<meta\s+name="dtb:uid"\s+content=")[^"]*(")', re.I)
 DCTERMS = re.compile(r'<meta\b[^>]*\bproperty\s*=\s*"dcterms:modified"', re.I)
+
+# EPUB 3 defines exactly these properties on a manifest <item>, and these on a
+# spine <itemref>; epubcheck rejects any other token as OPF-027.  A Duokan-made
+# book tags two itemrefs `duokan-page-fullscreen`.
+ITEM_PROPERTIES = frozenset((
+    'cover-image', 'mathml', 'nav', 'remote-resources', 'scripted', 'svg',
+    'switch'))
+ITEMREF_PROPERTIES = frozenset(('page-spread-left', 'page-spread-right'))
+ITEMREF_PROP = re.compile(
+    r'''(?is)(<itemref\b[^>]*?)\s+properties\s*=\s*["']([^"']*)["']''')
+
+# an empty <title> is RSC-005; the document's own <h1> is the natural filler
+TITLE_MATCH = re.compile(r'(?is)<title\s*/\s*>|<title\s*>(.*?)</title\s*>')
+H1_MATCH = re.compile(r'(?is)<h1\b[^>]*>(.*?)</h1\s*>')
+MARKUP = re.compile(r'(?s)<[^>]*>')
+
+# navPoints naming the same document must agree on playOrder -- see repair_ncx
+NAVPOINT_OPEN = re.compile(r'(?is)<navPoint\b([^>]*?)(/?>)')
+PLAYORDER = re.compile(r'''(?i)\s+playOrder\s*=\s*["']([^"']*)["']''')
 
 NAV_DOC = '''<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
@@ -253,6 +287,28 @@ def demote_opf2_attributes(s):
     return out, ['EPUB 2 opf: attribute(s) moved into <meta refines>']
 
 
+def strip_itemref_properties(s):
+    """Drop a spine <itemref> property EPUB 3 does not define.
+
+    The spine is the one part of the package upgrade_opf does not rebuild, so
+    an unknown token here survives on its own -- and epubcheck calls it OPF-027.
+    Returns (text, reasons).
+    """
+    dropped = []
+
+    def fix(m):
+        tokens = m.group(2).split()
+        keep = [t for t in tokens if t in ITEMREF_PROPERTIES]
+        dropped.extend(t for t in tokens if t not in ITEMREF_PROPERTIES)
+        return m.group(1) + (f' properties="{" ".join(keep)}"' if keep else '')
+
+    out = ITEMREF_PROP.sub(fix, s)
+    if not dropped:
+        return s, []
+    return out, ['undefined itemref properties token(s) removed: '
+                 + ', '.join(sorted(set(dropped)))]
+
+
 def package_identifier(opf_text):
     """The value of the dc:identifier that package/@unique-identifier names."""
     ref = re.search(r'<package\b[^>]*\bunique-identifier\s*=\s*"([^"]+)"',
@@ -332,6 +388,21 @@ def upgrade_opf(s, urn, opf_dir, referenced, names, lang, cover,
     if len(ITEM.findall(m.group(2))) != len(kept):
         reasons.append('duplicate manifest item')
 
+    # an undefined property token is OPF-027; drop it before we rebuild the
+    # manifest, and before the additions below put the ones we do want on
+    unknown = set()
+    for a in kept:
+        tokens = (a.get('properties') or '').split()
+        allowed = [t for t in tokens if t in ITEM_PROPERTIES]
+        unknown.update(t for t in tokens if t not in ITEM_PROPERTIES)
+        if allowed:
+            a['properties'] = ' '.join(allowed)
+        else:
+            a.pop('properties', None)
+    if unknown:
+        reasons.append('undefined properties token(s) removed: '
+                       + ', '.join(sorted(unknown)))
+
     declared = {posixpath.normpath(posixpath.join(opf_dir, a['href']))
                 for a in kept}
     missing = sorted(t for t in referenced - declared if t in names)
@@ -381,7 +452,8 @@ def upgrade_opf(s, urn, opf_dir, referenced, names, lang, cover,
                             if k in a) + '/>'
         for a in kept) + '\n'
     s = s[:m.start(2)] + body + s[m.end(2):]
-    return s, reasons
+    s, ref_reasons = strip_itemref_properties(s)
+    return s, reasons + ref_reasons
 
 
 # --------------------------------------------------------------------------
@@ -434,21 +506,110 @@ def repair_markup(raw):
     return IMG_TAG.sub(fix, text).encode('utf-8')
 
 
-def repair_css(raw):
-    return FONT_FACE.sub('', raw.decode('utf-8')).encode('utf-8')
+def empty_title(blob):
+    """True when the document's <title> carries nothing at all."""
+    m = TITLE_MATCH.search(blob.decode('utf-8', 'replace'))
+    return m is not None and (m.group(1) is None or not m.group(1).strip())
 
 
-def repair_ncx(raw, ident):
-    """Point the NCX identity at the package identity.
+def fill_empty_title(blob, fallback):
+    """Give an empty <title> the document's own heading, or the book's name.
 
-    Left alone when the NCX names no identity at all: there is nothing to
-    reconcile, and inventing one would be a change the caller did not ask for.
+    `<title></title>` is RSC-005, and an epubBuilder-era book leaves every page
+    that way.  The page's own <h1> keeps each document announcing itself, and
+    the package's dc:title covers the pages that have no heading.  A title that
+    already says something is never touched.
+    """
+    if not empty_title(blob):
+        return blob
+    try:
+        raw = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        return blob
+    heading = H1_MATCH.search(raw)
+    title = ' '.join(MARKUP.sub(' ', heading.group(1)).split()) if heading else ''
+    title = title or fallback
+    if not title:
+        return blob
+    return TITLE_MATCH.sub(lambda m: '<title>' + escape(title) + '</title>',
+                           raw, count=1).encode('utf-8')
+
+
+def play_orders(ncx_text, ncx_dir):
+    """The playOrder every navPoint should carry, in document order.
+
+    epubcheck has two rules here, and together they fix the numbering: two
+    navPoints that resolve to the same reference must give the same playOrder,
+    and the values must then run 1..n with no gaps.  So the order belongs to
+    the reference rather than to the navPoint, and references are numbered by
+    first appearance -- the rule render_ncx() already follows when this project
+    writes an NCX of its own.  The fragment counts as part of the reference:
+    two anchors in one document are different targets and must not collide.
+
+    An NCX that carries no playOrder at all is left alone: nothing is
+    inconsistent, and stamping orders onto a book that opted out of them is a
+    change the caller did not ask for.  Returns [] for that case, and for an
+    NCX with no navPoints; None if it will not parse.
+    """
+    try:
+        root = ET.fromstring(ncx_text)
+    except ET.ParseError:
+        return None
+    keys, numbered = [], False
+    for point in root.iter():
+        if point.tag.rsplit('}', 1)[-1] != 'navPoint':
+            continue
+        content = point.find('n:content', NS)
+        src = (content.get('src') if content is not None else '') or ''
+        file, _, frag = src.partition('#')
+        target = posixpath.normpath(
+            posixpath.join(ncx_dir, file)) if file else ''
+        keys.append(target + '#' + frag)
+        numbered = numbered or point.get('playOrder') is not None
+    if not numbered:
+        return []
+    seen = {}
+    return [seen.setdefault(key, len(seen) + 1) for key in keys]
+
+
+def repair_ncx(raw, ident, ncx_dir):
+    """Bring the NCX into line with the package: its identity and its order.
+
+    Two independent repairs, either of which may be a no-op:
+
+    * the NCX has to carry the package's own identity -- an NCX naming a
+      different uuid is NCX-001.  Left alone when it names no identity at all:
+      there is nothing to reconcile, and inventing one would be a change the
+      caller did not ask for;
+    * navPoints have to agree on playOrder per reference and number 1..n with
+      no gaps (see play_orders).  An NCX that already does comes back
+      byte-for-byte.
+
+    Returns the NCX bytes.
     """
     text = raw.decode('utf-8')
-    if not NCX_UID.search(text):
-        return raw
-    return NCX_UID.sub(lambda m: m.group(1) + ident + m.group(2),
-                       text).encode('utf-8')
+    if NCX_UID.search(text):
+        text = NCX_UID.sub(lambda m: m.group(1) + ident + m.group(2), text)
+
+    orders = play_orders(text, ncx_dir)
+    if orders:
+        pending = iter(orders)
+
+        def renumber(m):
+            attrs, tail = m.group(1), m.group(2)
+            order = next(pending, None)
+            if order is None:
+                return m.group(0)
+            current = PLAYORDER.search(attrs)
+            if current is None:
+                return '<navPoint' + attrs + f' playOrder="{order}"' + tail
+            if current.group(1) == str(order):
+                return m.group(0)
+            return '<navPoint' + PLAYORDER.sub(
+                f' playOrder="{order}"', attrs, count=1) + tail
+
+        text = NAVPOINT_OPEN.sub(renumber, text)
+    return text.encode('utf-8')
 
 
 # --------------------------------------------------------------------------
@@ -458,8 +619,8 @@ def repair_ncx(raw, ident):
 def analyse(src, cover_bytes=None, cover_name=None):
     """Everything `src` needs, computed without writing.
 
-    Returns (reasons, entries, patched, uid).  An empty `reasons` means the
-    file is already a conformant EPUB 3 and `patched` should be ignored.
+    Returns (reasons, entries, patched, urn, cover).  An empty `reasons` means
+    the file is already a conformant EPUB 3 and `patched` should be ignored.
     """
     from split_epubs import normalise_html
 
@@ -490,6 +651,10 @@ def analyse(src, cover_bytes=None, cover_name=None):
         uuid.NAMESPACE_URL, 'epub-normalise:' + os.path.basename(src)))
     lang_m = re.search(r'<dc:language\b[^>]*>\s*([^<]*?)\s*<', raw_opf)
     lang, _ = normalise_lang(lang_m.group(1) if lang_m else 'zh')
+    # the package's own name, for a document with no <h1> of its own and an
+    # empty <title> that still has to say something
+    title_m = re.search(r'<dc:title\b[^>]*>\s*([^<]*?)\s*<', raw_opf)
+    book_title = title_m.group(1).strip() if title_m else ''
 
     _, kept = manifest_items(raw_opf)
     cover = cover_href(raw_opf, opf_dir, kept or []) if kept else None
@@ -510,23 +675,44 @@ def analyse(src, cover_bytes=None, cover_name=None):
     ncx_dir = posixpath.dirname(ncx_name) if ncx_name else opf_dir
 
     patched = {}
+    retitled = 0
+    bad_attrs = []
     for info, name, data in entries:
         if name == opf_name:
             patched[name] = new_opf.encode('utf-8')
         elif name.lower().endswith('.css'):
-            fixed = repair_css(data)
+            try:
+                text = data.decode('utf-8')
+            except UnicodeDecodeError:
+                patched[name] = data
+                continue
+            # keep_local_fonts: a stylesheet whose @font-face lists device
+            # fonts through local() only reaches for the missing file last, so
+            # the dead source goes and the rule stays
+            fixed = fix_dead_css(text, name, nameset,
+                                 keep_local_fonts=True).encode('utf-8')
             if fixed != data:
-                reasons.append('device fonts (res://) in the stylesheet')
+                reasons.append(f'dead reference(s) removed from {name}')
             patched[name] = fixed
         elif name.lower().endswith('.ncx'):
-            fixed = repair_ncx(data, ident)
+            fixed = repair_ncx(data, ident, ncx_dir)
             if fixed != data:
-                reasons.append('NCX identifier did not match the package '
-                               'identifier')
+                reasons.append('NCX brought into line with the package')
             patched[name] = fixed
         elif name.lower().endswith(('.html', '.xhtml', '.htm')):
             fixed = normalise_html(repair_markup(data), name, nameset)
+            if empty_title(fixed):
+                stem = posixpath.splitext(posixpath.basename(name))[0]
+                fixed = fill_empty_title(fixed, book_title or stem)
+                retitled += 1
+            bad_attrs += invalid_data_attrs(data)
             patched[name] = fixed
+
+    if retitled:
+        reasons.append(f'{retitled} empty <title> element(s) filled')
+    if bad_attrs:
+        reasons.append('invalid custom data attribute(s) dropped: '
+                       + ', '.join(sorted(set(bad_attrs))))
 
     if ncx_name and not any(n == posixpath.join(opf_dir, 'nav.xhtml')
                             for n in names):

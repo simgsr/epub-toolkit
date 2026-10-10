@@ -7,6 +7,22 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `verify_epubs.py` rejected a fragment-only nav link such as `href="#toc"`,
+  resolving it against the nav document's directory instead of the document
+  itself and reporting `nav link -> missing file` for a link that was correct.
+  The same mis-resolution in the NCX check is fixed with it.
+- `normalise_epub.py` copied a structurally-sound EPUB 3 through untouched,
+  discarding the repairs it had just computed.  It now also detects and repairs
+  the defects that live in the content documents and the package, so a book that
+  needs one of them is rewritten instead of passed over: an empty `<title>`
+  (RSC-005), a stylesheet `@font-face` whose font file the book does not carry
+  (RSC-007), a `properties` token EPUB 3 does not define on a manifest item or a
+  spine `<itemref>` (OPF-027), a Kindle `data-*` attribute that is not a legal
+  custom data attribute (HTM_061), and an NCX whose `playOrder` disagrees
+  between navPoints naming the same target, or leaves gaps in the sequence.
+
 ## [1.0.0] - 2026-10-10
 
 First public release.

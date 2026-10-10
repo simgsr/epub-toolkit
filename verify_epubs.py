@@ -188,7 +188,9 @@ def check(path):
                 links_checked += 1
                 target = href.split('#', 1)[0]
                 frag = href.split('#', 1)[1] if '#' in href else ''
-                resolved = posixpath.normpath(
+                # a bare "#frag" points into the nav document itself; joining
+                # it onto the directory would name a directory, not a file
+                resolved = nav_path if not target else posixpath.normpath(
                     posixpath.join(posixpath.dirname(nav_path), target))
                 if resolved not in names:
                     rep.error(f'nav link -> missing file: {href}')
@@ -218,7 +220,8 @@ def check(path):
                     continue
                 n += 1
                 target, _, frag = src.partition('#')
-                resolved = posixpath.normpath(
+                # as with the nav, a bare "#frag" means the NCX document
+                resolved = ncx_path if not target else posixpath.normpath(
                     posixpath.join(posixpath.dirname(ncx_path), target))
                 if resolved not in names:
                     rep.error(f'NCX -> missing file: {src}')

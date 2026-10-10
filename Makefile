@@ -81,7 +81,7 @@ run:                 ## everything, stopping at the first failure
 	@$(MAKE) --no-print-directory check
 
 clean:               ## drop reports and caches (keeps $(SPLIT)/*.epub)
-	@rm -rf $(REPORTS) __pycache__
+	@rm -rf $(REPORTS) __pycache__ .ruff_cache
 	@find . -name .DS_Store -delete 2>/dev/null || true
 	@echo "cleaned $(REPORTS)/ and caches; $(SPLIT)/*.epub left alone"
 

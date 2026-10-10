@@ -9,4 +9,6 @@ epubcheck-out/
 # Caches and macOS noise.  `make clean` removes these too.
 __pycache__/
 *.py[cod]
+.ruff_cache/
+.venv/
 .DS_Store

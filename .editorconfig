@@ -1,0 +1,26 @@
+# https://editorconfig.org -- describes what the files here already do, so
+# editors do not drift from it.  Verified: every tracked file is LF, carries no
+# trailing whitespace, and ends with a newline.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.py]
+indent_style = space
+indent_size = 4
+
+# GNU Make 3.81 recipes are tab-indented; this file must never be reformatted.
+[Makefile]
+indent_style = tab
+
+[*.{yml,yaml,toml}]
+indent_style = space
+indent_size = 2
+
+# Markdown uses two trailing spaces for a hard line break.
+[*.md]
+trim_trailing_whitespace = false

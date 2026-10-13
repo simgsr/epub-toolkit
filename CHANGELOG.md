@@ -22,6 +22,22 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   spine `<itemref>` (OPF-027), a Kindle `data-*` attribute that is not a legal
   custom data attribute (HTM_061), and an NCX whose `playOrder` disagrees
   between navPoints naming the same target, or leaves gaps in the sequence.
+- `normalise_epub.py` declared the wrong manifest item as the cover, leaving
+  `properties="cover-image"` on the cover *page* rather than the cover *image*.
+  Two things were wrong: EPUB 2's `<meta name="cover" content="…"/>` was only
+  read with its attributes in that order, which misses the equally common
+  reversed spelling, and the fallback then took the first manifest item whose
+  href mentioned "cover" — for a book carrying both, that is `cover.xhtml`.  The
+  `<meta>` is now read in either order, only an image can be the cover, and a
+  stray token left on any other item is cleared.
+- `normalise_epub.py` wrote a book arriving from outside into `split/` under a
+  free name, so every run left another `name (2)`, `name (3)` … beside the first
+  copy.  A book now lands on its own name, rewriting the output it produced
+  earlier in place.
+- `verify_epubs.py` reported `cover image suspiciously small` when the property
+  sat on the cover's XHTML page.  That is true of the 600 byte page it then
+  read, but it sent you looking for a small image; the non-image carrying the
+  property is now named.
 
 ## [1.0.0] - 2026-10-10
 

@@ -142,6 +142,13 @@ def check(path):
                   if 'cover-image' in (i.get('properties') or '').split()]
         if len(covers) > 1:
             rep.error('more than one cover-image')
+        for i in covers:
+            # only an image can be the cover image: a book that tags its cover
+            # *document* with the property gets its 600 byte page read below
+            # as though it were the cover, and reported as a small one
+            if not (i.get('media-type') or '').startswith('image/'):
+                rep.error(f'cover-image declared on non-image {i.get("href")} '
+                          f'({i.get("media-type")})')
 
         # ---- spine -------------------------------------------------------
         spine = opf.findall('.//o:spine/o:itemref', N)

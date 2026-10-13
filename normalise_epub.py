@@ -215,21 +215,44 @@ def manifest_items(s):
     return m, kept
 
 
+def is_image_item(a):
+    """Whether a manifest item is an image, by media-type or by extension.
+
+    Only an image can be the cover image.  A book whose cover *document* is
+    called cover.xhtml is not declaring that document to be the cover image,
+    however much its name suggests it.
+    """
+    media = (a.get('media-type') or '').strip().lower()
+    if not media:
+        media = MEDIA.get(posixpath.splitext(a.get('href', ''))[1].lower(), '')
+    return media.startswith('image/')
+
+
 def cover_href(s, opf_dir, kept):
     """The href of the book's cover image, from either EPUB generation."""
     for a in kept:
-        if 'cover-image' in (a.get('properties') or '').split():
+        if ('cover-image' in (a.get('properties') or '').split()
+                and is_image_item(a)):
             return posixpath.normpath(posixpath.join(opf_dir, a['href']))
-    m = re.search(r'<meta\b[^>]*\bname\s*=\s*"cover"[^>]*\bcontent\s*=\s*"([^"]+)"', s, re.I)
-    if m:
-        by_id = {a.get('id'): a.get('href') for a in kept}
-        href = by_id.get(m.group(1))
-        if href:
-            return posixpath.normpath(posixpath.join(opf_dir, href))
+
+    # EPUB 2 declares it with <meta name="cover" content="ID"/>.  The two
+    # attributes come in either order, so take the tag apart rather than
+    # matching one spelling of it.
+    by_id = {a.get('id'): a for a in kept}
+    by_href = {a.get('href'): a for a in kept}
+    for tag in re.findall(r'<meta\b[^>]*>', s, re.I):
+        attrs = dict(ATTR.findall(tag))
+        if attrs.get('name', '').strip().lower() != 'cover':
+            continue
+        want = attrs.get('content', '').strip()
+        item = by_id.get(want) or by_href.get(want)
+        if item is not None and is_image_item(item):
+            return posixpath.normpath(posixpath.join(opf_dir, item['href']))
+
+    # nothing usable declared: the image whose name mentions the cover
     for a in kept:
-        href = a.get('href', '')
-        if re.search(r'(?i)\bcover\b', href):
-            return posixpath.normpath(posixpath.join(opf_dir, href))
+        if is_image_item(a) and re.search(r'(?i)\bcover\b', a.get('href', '')):
+            return posixpath.normpath(posixpath.join(opf_dir, a['href']))
     return None
 
 
@@ -425,9 +448,27 @@ def upgrade_opf(s, urn, opf_dir, referenced, names, lang, cover,
         reasons.append(f'{len(svg_bare)} document(s) use SVG but did not '
                         f'declare properties="svg"')
 
+    # properties="cover-image" belongs on one image and on nothing else.  A
+    # book may arrive with it on its cover *document* -- the page whose only
+    # job is to hold the <img> -- which leaves verify_epubs.py reading a 600
+    # byte page as though it were the cover image.  Clear every item the token
+    # does not belong on before declaring the one it does.
+    rel = posixpath.relpath(cover, opf_dir) if cover is not None else None
+    stray = [a for a in kept
+             if 'cover-image' in (a.get('properties') or '').split()
+             and (a.get('href') != rel or not is_image_item(a))]
+    for a in stray:
+        keep = [t for t in a['properties'].split() if t != 'cover-image']
+        if keep:
+            a['properties'] = ' '.join(keep)
+        else:
+            a.pop('properties', None)
+    if stray:
+        reasons.append(f'cover-image removed from {len(stray)} item(s) it does '
+                       f'not belong on')
+
     # the cover must be declared the EPUB 3 way
     if cover is not None:
-        rel = posixpath.relpath(cover, opf_dir)
         hit = next((a for a in kept if a.get('href') == rel), None)
         if hit is None:
             kept.append({'id': 'cover-image', 'href': rel,
@@ -766,16 +807,6 @@ def is_bundle(path):
     return any(cfg['match'] in base for cfg in BUNDLES)
 
 
-def free_name(out_dir, base):
-    """`base`, or "base (2)" / "base (3)" ... if that name is taken."""
-    stem, ext = os.path.splitext(base)
-    name, n = base, 1
-    while os.path.exists(os.path.join(out_dir, name)):
-        n += 1
-        name = f'{stem} ({n}){ext}'
-    return name
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('files', nargs='*', metavar='FILE',
@@ -842,7 +873,7 @@ def main():
             elif args.dry_run:
                 print(f'OK    {base} (already EPUB 3; would copy into {args.out}/)')
             else:
-                dst = os.path.join(args.out, free_name(args.out, base))
+                dst = os.path.join(args.out, base)
                 os.makedirs(args.out, exist_ok=True)
                 shutil.copyfile(src, dst)
                 print(f'OK    {base} (already EPUB 3; copied in)')
@@ -857,11 +888,12 @@ def main():
             print('        - NO-COVER (none found in the book)')
         if args.dry_run:
             continue
-        # a book already in the output directory is rewritten in place; only a
-        # coming-in book needs a free name so it cannot clobber a finished one
+        # A book lands on its own name, whether it came in from outside or is
+        # already in the output directory.  A top-level book is copied in on
+        # every run, so taking a free name instead of overwriting would leave
+        # "base (2)", "base (3)" ... behind on every run.  The output directory
+        # is this tool's own, so re-running rewrites in place.
         dst = os.path.join(args.out, base)
-        if os.path.abspath(dst) != os.path.abspath(src):
-            dst = os.path.join(args.out, free_name(args.out, base))
         write_epub(dst, entries, patched)
 
     print(f'\n{len(todo)} file(s): {changed} rewritten, '

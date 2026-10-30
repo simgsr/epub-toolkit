@@ -176,6 +176,53 @@ def check(path):
             except ET.ParseError as exc:
                 rep.error(f'{doc} is not well-formed: {exc}')
 
+        # ---- content documents: repeated ids and dead link targets --------
+        # Two epubcheck rules a rewritten book used to fail with nothing here
+        # noticing: RSC-005 for an `id` a document repeats (a converter
+        # emitting the same footnote anchor twice) and RSC-012 for a link whose
+        # `#fragment` names no anchor in the document it points at.  Both are
+        # cheap to check from the documents themselves, so the pipeline fails
+        # on its own rather than waiting for the Java checker.
+        ids_by_doc = {}
+        for doc in spine_docs:
+            if not doc.endswith(('.html', '.xhtml', '.htm')) or doc not in names:
+                continue
+            try:
+                root = ET.fromstring(z.read(doc))
+            except ET.ParseError:
+                continue                 # already reported above
+            seen, repeats, targets = set(), [], set()
+            for el in root.iter():
+                value = el.get('id')
+                if value is None:
+                    continue
+                targets.add(value)
+                if value in seen:
+                    repeats.append(value)
+                seen.add(value)
+            ids_by_doc[doc] = targets
+            for value in sorted(set(repeats)):
+                rep.error(f'{doc}: duplicate id "{value}"')
+
+        for doc, _targets in ids_by_doc.items():
+            try:
+                root = ET.fromstring(z.read(doc))
+            except ET.ParseError:
+                continue
+            for a in root.iter('{http://www.w3.org/1999/xhtml}a'):
+                href = a.get('href') or ''
+                if '#' not in href or re.match(r'^[A-Za-z][\w+.\-]*:', href):
+                    continue             # external, or nothing to resolve
+                target, _, frag = href.partition('#')
+                if not frag:
+                    continue
+                resolved = doc if not target else posixpath.normpath(
+                    posixpath.join(posixpath.dirname(doc), target))
+                if resolved not in ids_by_doc:
+                    continue             # dead file: reported by epubcheck
+                if frag not in ids_by_doc[resolved]:
+                    rep.error(f'{doc}: link -> missing anchor: {href}')
+
         # ---- navigation --------------------------------------------------
         nav_items = [i for i in manifest.values()
                      if 'nav' in (i.get('properties') or '').split()]

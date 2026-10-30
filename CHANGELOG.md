@@ -26,9 +26,58 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   book declares a NUMBER for it -- "Mistborn 01" is what sorts a shelf, while a
   publisher's set such as 阿兰·德波顿作品全集 carries no `group-position` and
   would only repeat the author inside the book name.
+- `verify_epubs.py` now checks what it used to leave to epubcheck: an `id` a
+  document repeats, and a link whose `#fragment` names no anchor in the document
+  it points at.  CI still runs epubcheck, but the pipeline now fails on its own.
 
 ### Fixed
 
+- `normalise_epub.is_bundle()` decided that a file was a bundle from its name
+  alone.  A split book is named `<author> - <title>`, so every book out of a set
+  whose key is the author's own name (崔曼莉, 铁凝, 德波顿) also answered yes and
+  was skipped -- by `correct`, and by the new `names` check.  A bundle is now
+  identified by its set title as well, which the BUNDLES entry already names.
+- `normalise_epub.py` left an EPUB 2 `<dc:date opf:event="modification">` alone,
+  which is two RSC-005 errors -- the attribute and the element carrying it -- and
+  kept the second `dc:date` that Calibre writes, which EPUB 3 does not allow
+  either.  The attribute is dropped and only the first date is kept.
+- `normalise_epub.py` could not repair the NCX identity when the `dtb:uid` meta
+  wrote `content` before `name`, so that book failed NCX-001 on every run.  The
+  same reversed-attribute-order defect was already fixed for the cover `<meta>`;
+  the NCX is now read by attribute name too.
+- `normalise_epub.py` left navPoint ids such as `001` in place.  An `id` has to
+  be an XML name, and a converter that numbers its navPoints writes one that is
+  not, so epubcheck rejected every entry as RSC-005.  Those ids are renamed.
+- A document that repeats an `id` is now deduplicated: the first copy keeps its
+  name, so every reference to that anchor still resolves, and the later copies
+  gain a suffix (RSC-005).
+- A link whose `#fragment` names no anchor in its target document no longer
+  fails the book (RSC-012): the link stays and the dead fragment goes.
+- `cellpadding`, and the `alr` attribute a Word-to-EPUB converter emits where it
+  meant `align`, are dropped the way `cellspacing` already was.
+- An ARIA labelling attribute on `<nav>` inside a navigation document is
+  dropped: epubcheck 5.4 rejects `aria-label` there (RSC-005) while accepting the
+  same element with it in a content document.  The nav keeps its `epub:type` and
+  `role`.
+- The generated navigation document gave an English book a Chinese heading.  The
+  heading is now the book's own language -- 目录 for a Chinese volume, Contents
+  otherwise -- which is the one mark the template was leaving of the Chinese
+  bundles it was written for.
+- A converter's NCX that lists a chapter twice -- its section marker and its
+  title, both opening the same page -- is folded into one entry rather than
+  shown as two links to the same place: the labels are joined and the leading
+  word capitalised ("one / Suffering and a Crisis of Faith" becomes "One:
+  Suffering and a Crisis of Faith").  The legacy NCX is then rendered from the
+  same folded tree the nav document uses, so the two agree instead of
+  disagreeing about what the book contains.
+- The whitespace-only `<div>` a converter leaves between list items is dropped.
+  A `<div>` is not a legal child of `<ol>`/`<ul>`, so epubcheck rejected the
+  whole document over a spacer no reader ever sees (RSC-005).
+- A content-document repair now triggers the rewrite on its own.  Before, only
+  a package-level reason did, so an EPUB 3 whose package was fine but whose
+  documents needed one of the repairs above was still copied through untouched
+  -- the case the 1.0.0 entry promised to cover.  "Already EPUB 3" now means
+  what it says: not one byte changed.
 - `verify_epubs.py` rejected a fragment-only nav link such as `href="#toc"`,
   resolving it against the nav document's directory instead of the document
   itself and reporting `nav link -> missing file` for a link that was correct.

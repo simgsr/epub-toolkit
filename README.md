@@ -62,7 +62,7 @@ make SPLIT=books PYTHON=python3.14 run
 | script | job |
 |---|---|
 | `split_epubs.py` | split each multi-book bundle into one EPUB per work, from the bundle's own NCX / 总目录 / structural marks (`--list` to preview) |
-| `normalise_epub.py` | repair an old EPUB (namespace typo, dead identifier, undeclared images, GBK member names, `res://` and missing fonts, empty `<title>`, undefined `properties`, Kindle `data-*`, NCX `playOrder`, CRLF mimetype) **and** upgrade it to EPUB 3, without touching the prose |
+| `normalise_epub.py` | repair an old EPUB (namespace typo, dead identifier, undeclared images, GBK member names, `res://` and missing fonts, empty `<title>`, undefined `properties`, Kindle `data-*`, NCX `playOrder` and non-XML ids, a second `dc:date`, repeated ids, links to anchors the book does not carry, CRLF mimetype) **and** upgrade it to EPUB 3, without touching the prose |
 | `verify_epubs.py` | structural checks: container/OPF, manifest↔archive agreement, spine, navigation links and fragment targets, cover, no leaked set-level pages |
 | `content_check.py` | prove no text was lost or invented, comparing each output document against the source bundle it came from |
 | `summarise_epubcheck.py` | roll the per-book epubcheck JSON reports into one tally |

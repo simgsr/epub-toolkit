@@ -82,6 +82,13 @@ BUNDLES = [
     #
     #   key, match, author, set_title, embedded_cover   -- always
     #
+    # `set_title` must be a substring of the bundle's own dc:title.  It is not
+    # only the name reported for the set: normalise_epub.is_bundle() uses it to
+    # tell the bundle from the books that came out of it, because those are
+    # named "<author> - <title>" and most `match` keys are the author's own name
+    # -- without it, every split book would be mistaken for a bundle and
+    # skipped, by `correct` and by the `names` check.
+    #
     #   authors={label: author}   per-work attribution in a multi-author set
     #   cover_page='封面'          bind the cover from the page with this title
     #   cover_page_precedes=True  that page may sit one document *before* the
@@ -175,6 +182,14 @@ BUNDLES = [
     # spine documents, so it needs neither `book_marks` nor `books_page`.
     dict(key='tiening', match='铁凝', author='铁凝',
          set_title='铁凝长篇四部', embedded_cover=False),
+
+    # 阿兰·德波顿作品全集（套装共14册）: the ordinary case at its largest --
+    # fourteen works, each a top-level navPoint with its own chapters beneath it,
+    # so the NCX is all the engine needs.  The three entries in front (版权信息,
+    # Digital Lab简介, 总目录) are the set's own pages, and all three are already
+    # in FRONT_TITLES, so this needs no `skip_titles` either.
+    dict(key='debotton', match='德波顿', author='阿兰·德波顿',
+         set_title='阿兰·德波顿作品全集', embedded_cover=False),
 ]
 
 
@@ -669,6 +684,58 @@ def finalise_toc(nodes, opf_dir):
     return out
 
 
+def merge_labels(run):
+    """Fold the labels of a same-target run into one TOC entry.
+
+    A converter's NCX splits a chapter into two lines -- its section marker
+    ("one") and its title ("Suffering and a Crisis of Faith"), both opening
+    the same page.  A publisher's navigation joins them, so the first label
+    stands and a later one is carried in with a colon, and the leading word
+    is capitalised: "one / Suffering and a Crisis of Faith" becomes "One:
+    Suffering and a Crisis of Faith".  A run with no usable label yields ''.
+    """
+    parts = [((g.get('title') or '').strip()) for g in run]
+    parts = [p for p in parts if p]
+    if not parts:
+        return ''
+    text = ': '.join(parts)
+    return text[0].upper() + text[1:] if text[:1].islower() else text
+
+
+def collapse_same_target(nodes):
+    """Fold consecutive entries that open the same page into one entry.
+
+    A reader is then offered a single link to each place instead of the
+    converter's two (or more).  Only neighbours that resolve to the very same
+    target are joined -- their children are kept, in order -- and an entry
+    whose neighbours point elsewhere is left exactly as the book gave it, in
+    the book's own order.
+    """
+    out = []
+    i, n = 0, len(nodes)
+    while i < n:
+        key = nodes[i].get('href') or nodes[i].get('file')
+        children = list(nodes[i].get('children') or [])
+        j = i + 1
+        while j < n and key is not None:
+            nkey = nodes[j].get('href') or nodes[j].get('file')
+            if nkey != key:
+                break
+            children.extend(nodes[j].get('children') or [])
+            j += 1
+        if j - i > 1:
+            node = dict(nodes[i])
+            node['children'] = children
+            merged = merge_labels(nodes[i:j])
+            if merged:
+                node['title'] = merged
+            out.append(node)
+        else:
+            out.append(nodes[i])
+        i = j
+    return out
+
+
 def order_by_spine(nodes, index):
     """Sort each TOC level into reading order.
 
@@ -935,6 +1002,42 @@ def count_nodes(nodes):
     return sum(1 + count_nodes(n.get('children') or []) for n in nodes)
 
 
+def ncx_document(tree, uid, title, lang='zh'):
+    """A complete NCX -- head, docTitle, navMap -- from a finalised tree.
+
+    The legacy EPUB 2 navigation a package may still carry.  A reader's table
+    of contents today is the EPUB 3 nav document, so the NCX is rendered from
+    the very same folded tree the nav document uses, and agrees with it rather
+    than being left as the source's -- where a converter listed a chapter
+    twice.  Only produced when that folding actually changed the tree; a tree
+    with no doubled entries is never re-emitted.
+    """
+    depth = 1
+    for n in tree:
+        for c in n.get('children') or []:
+            depth = max(depth, 1 + _nesting(c))
+    return ('<?xml version="1.0" encoding="utf-8"?>\n'
+            '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" '
+            f'version="2005-1" xml:lang="{escape(lang, {chr(39): "&#39;"})}">\n'
+            '  <head>\n'
+            f'    <meta name="dtb:uid" content="{escape(uid)}"/>\n'
+            f'    <meta name="dtb:depth" content="{depth}"/>\n'
+            '    <meta name="dtb:totalPageCount" content="0"/>\n'
+            '    <meta name="dtb:maxPageNumber" content="0"/>\n'
+            '  </head>\n'
+            f'  <docTitle><text>{escape(title)}</text></docTitle>\n'
+            '  <navMap>\n'
+            f'{render_ncx(tree, uid)}\n'
+            '  </navMap>\n'
+            '</ncx>\n')
+
+
+def _nesting(node):
+    """Depth of a subtree, counting the node itself."""
+    children = node.get('children') or []
+    return 1 + max((_nesting(c) for c in children), default=0)
+
+
 COVER_PAGE = '''<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="zh" lang="zh">
@@ -1074,6 +1177,26 @@ def drop_li_value(blob):
                       raw).encode('utf-8')
 
 
+LIST_FILLER = re.compile(r'(?i)</li>(?:\s*<div\b[^>]*>\s*</div>)+')
+
+
+def drop_list_filler(blob):
+    """Strip the whitespace-only <div> a converter drops between list items.
+
+    calibre's HTML puts a `<div class="..."> </div>` spacer after each
+    `</li>`, and a <div> is not a legal child of a list, so epubcheck refuses
+    the whole document over it (RSC-005).  The div holds only whitespace, so
+    deleting it changes nothing a reader sees.  It is anchored to the `</li>`
+    it follows, so a <div> that closes a list (or that stands as a genuine
+    block elsewhere) is never touched.
+    """
+    try:
+        raw = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        return blob
+    return LIST_FILLER.sub('</li>', raw).encode('utf-8')
+
+
 # The two stray attributes the export tool of the 阿来, 刘醒龙 and 江户川乱步
 # bundles left behind.  Neither belongs to any version of HTML, so epubcheck
 # refuses the whole document over them (RSC-005).  `active="true"` marks a
@@ -1085,8 +1208,13 @@ def drop_li_value(blob):
 # stylesheet, so a renderer that understood `cellspacing` still drew the 2px
 # the class asks for.  Deleting both therefore leaves every page with the
 # rendering the source actually had.
+# `cellspacing`, `cellpadding` and `border` were presentational hints HTML 4
+# allowed on a table and EPUB 3 does not; the first was the original entry.
+# `alr` is not a name any HTML version defines -- a Word-to-EPUB converter
+# truncated `align` to it and left it empty on an image, which epubcheck
+# rejects as RSC-005.
 LEGACY_ATTR = re.compile(
-    r'''(?i)\s*(?<![\w-])(?:active|cellspacing)\s*=\s*'''
+    r'''(?i)\s*(?<![\w-])(?:active|cellspacing|cellpadding|alr)\s*=\s*'''
     r'''(?:"[^"]*"|'[^']*'|[^\s>]+)''')
 
 
@@ -1139,6 +1267,97 @@ def invalid_data_attrs(blob):
             if not a.group(1) or DATA_UPPER.search(a.group(1)):
                 bad.append(a.group(0).split('=')[0].strip())
     return bad
+
+
+# An `id` is an XML name: it may not repeat inside one document.  A converted
+# book repeats a footnote target whenever its converter emitted the anchor
+# twice (epubcheck RSC-005, "Duplicate ID"), so the later copies are renamed.
+ID_ATTR = re.compile(r'''(?i)(\s+)id(\s*=\s*)(?:"([^"]*)"|'([^']*)')''')
+
+
+def dedupe_ids(blob):
+    """Give every repeated `id` in one document a unique name.
+
+    The FIRST copy keeps its name: every intra-book reference to that anchor --
+    a footnote link, a navPoint, a `#frag` in the NCX -- resolves to it, so
+    moving the name would break all of them to no purpose.  The later copies
+    gain a numeric suffix, which is what makes the document parse again while
+    leaving the reachable anchor exactly where it was.
+    """
+    try:
+        raw = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        return blob
+
+    seen = {}
+
+    def fix_tag(m):
+        def fix_attr(a):
+            name = a.group(3) if a.group(3) is not None else a.group(4)
+            count = seen.get(name, 0)
+            seen[name] = count + 1
+            if not count:
+                return a.group(0)
+            quote = '"' if a.group(3) is not None else "'"
+            fresh = f'{name}-{count + 1}'
+            while fresh in seen:                    # never collide with a real id
+                fresh += '_'
+            seen[fresh] = 1
+            return f'{a.group(1)}id{a.group(2)}{quote}{fresh}{quote}'
+
+        return ID_ATTR.sub(fix_attr, m.group(0))
+
+    out = TAG.sub(fix_tag, raw)
+    return out.encode('utf-8') if out != raw else blob
+
+
+# The EPUB navigation document's grammar lists the attributes a <nav> may carry,
+# and epubcheck 5.4 enforces it (RSC-005): `aria-expanded` is in that list, the
+# ARIA labelling attributes are not -- though the very same <nav> is accepted
+# with `aria-label` in a content document.  The nav is still announced by its
+# `epub:type` and `role`, so the label goes rather than the book failing check.
+ARIA_ATTR = re.compile(
+    r'''(?i)\s+aria-(?!expanded\b)[a-z-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)''')
+NAV_TAG = re.compile(r'(?is)<nav\b[^>]*>')
+
+
+def drop_nav_aria_attrs(blob):
+    """Delete the ARIA attributes a navigation document's grammar forbids."""
+    try:
+        raw = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        return blob
+    out = NAV_TAG.sub(lambda m: ARIA_ATTR.sub('', m.group(0)), raw)
+    return out.encode('utf-8') if out != raw else blob
+
+
+def duplicate_ids(blob):
+    """The ids this document repeats -- the read-only twin of dedupe_ids."""
+    try:
+        raw = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        return []
+    seen, dupes = set(), []
+    for tag in TAG.finditer(raw):
+        for a in ID_ATTR.finditer(tag.group(0)):
+            name = a.group(3) if a.group(3) is not None else a.group(4)
+            if name in seen:
+                dupes.append(name)
+            seen.add(name)
+    return dupes
+
+
+def nav_aria_attrs(blob):
+    """The ARIA attributes on <nav> -- the read-only twin of the dropper."""
+    try:
+        raw = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        return []
+    found = []
+    for m in NAV_TAG.finditer(raw):
+        found += [a.group(0).strip().split('=')[0]
+                  for a in ARIA_ATTR.finditer(m.group(0))]
+    return found
 
 
 # --- EPUB 2 markup the 金庸 bundles carry --------------------------------
@@ -1488,8 +1707,13 @@ def drop_orphan_close_tags(blob):
     return raw.encode('utf-8')
 
 
-def normalise_html(blob, path, keep):
-    """Every EPUB 3 fix-up a source document needs, applied in one place."""
+def normalise_html(blob, path, keep, nav=False):
+    """Every EPUB 3 fix-up a source document needs, applied in one place.
+
+    `nav` marks the book's navigation document: that one is validated against
+    the nav grammar rather than the ordinary content grammar, which forbids the
+    ARIA labelling attributes on <nav> (see drop_nav_aria_attrs).
+    """
     blob = strip_control_chars(blob)
     blob = escape_stray_angles(blob)
     blob = drop_orphan_close_tags(blob)
@@ -1506,8 +1730,12 @@ def normalise_html(blob, path, keep):
     blob = demote_align(blob)
     blob = demote_valign(blob)
     blob = drop_li_value(blob)
+    blob = drop_list_filler(blob)
     blob = drop_legacy_attrs(blob)
     blob = drop_invalid_data_attrs(blob)
+    blob = dedupe_ids(blob)
+    if nav:
+        blob = drop_nav_aria_attrs(blob)
     return blob
 
 

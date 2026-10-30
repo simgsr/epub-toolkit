@@ -73,8 +73,9 @@ import zipfile
 from xml.sax.saxutils import escape
 
 from epub_paths import SPLIT, WEB_COVERS
-from split_epubs import (BUNDLES, finalise_toc, fix_dead_css,
-                         invalid_data_attrs, render_nav)
+from split_epubs import (BUNDLES, collapse_same_target, duplicate_ids,
+                         finalise_toc, fix_dead_css, invalid_data_attrs,
+                         nav_aria_attrs, ncx_document, render_nav)
 
 NCX_NS = 'http://www.daisy.org/z3986/2005/ncx/'
 NS = {'n': NCX_NS}
@@ -92,6 +93,13 @@ IMG_SRC = re.compile(r'<img\b[^>]*?src="([^"]+)"', re.I)
 IMG_TAG = re.compile(r'<img\b[^>]*?>', re.I)
 ALT_ATTR = re.compile(r'\balt\s*=', re.I)
 NCX_UID = re.compile(r'(<meta\s+name="dtb:uid"\s+content=")[^"]*(")', re.I)
+# Calibre writes <meta content="..." name="dtb:uid"/> -- attributes in the
+# other order -- which the pattern above (written name-first) cannot see, so
+# that book keeps a foreign identity and epubcheck reports NCX-001 forever.
+# The repair therefore reads the attributes instead of matching their order.
+META_TAG = re.compile(r'(?is)<meta\b[^>]*>')
+META_ATTR = re.compile(r'''([\w:-]+)\s*=\s*(?:"[^"]*"|'[^']*')''')
+CONTENT_ATTR = re.compile(r'''(\bcontent\s*=\s*)(?:"[^"]*"|'[^']*')''')
 DCTERMS = re.compile(r'<meta\b[^>]*\bproperty\s*=\s*"dcterms:modified"', re.I)
 
 # EPUB 3 defines exactly these properties on a manifest <item>, and these on a
@@ -118,16 +126,27 @@ NAV_DOC = '''<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{lang}" lang="{lang}">
   <head>
     <meta charset="utf-8"/>
-    <title>目录</title>
+    <title>{heading}</title>
   </head>
   <body>
     <nav epub:type="toc" id="toc">
-      <h1>目录</h1>
+      <h1>{heading}</h1>
 {body}
     </nav>
   </body>
 </html>
 '''
+
+
+def nav_heading(lang):
+    """The contents-page title in the book's own language.
+
+    The nav document's <h1> is what a reader sees open the navigation, so it
+    must be in the book's language: 目录 for a Chinese volume, Contents
+    otherwise.  Leaving the English books a Chinese heading is the one mark of
+    a template written for the Chinese bundles.
+    """
+    return '目录' if lang.startswith('zh') else 'Contents'
 
 
 # --------------------------------------------------------------------------
@@ -256,7 +275,9 @@ def cover_href(s, opf_dir, kept):
     return None
 
 
-OPF2_ATTR = re.compile(r'\s+opf:(file-as|role|scheme)="([^"]*)"')
+OPF2_ATTR = re.compile(r'\s+opf:([\w-]+)="([^"]*)"')
+# only these two have somewhere to go in EPUB 3; the rest are recorded nowhere
+OPF2_REFINABLE = ('role', 'file-as')
 DC_OPEN = re.compile(r'<dc:([\w-]+)\b([^>]*?)(/?)>', re.I)
 
 
@@ -266,14 +287,20 @@ def demote_opf2_attributes(s):
     EPUB 2 hung `opf:role`, `opf:file-as` and `opf:scheme` off the Dublin Core
     elements themselves.  EPUB 3 allows none of them: the first two become
     <meta> elements refining the element they sat on, which therefore has to
-    gain an id, and `opf:scheme` is dropped outright, there being nowhere in
-    EPUB 3 to record a scheme for a plain-string identifier.  A Calibre-made
-    book carries four of these, which is five epubcheck RSC-005 errors -- one
-    creator element carries two.
+    gain an id, and the rest are dropped outright, there being nowhere in
+    EPUB 3 to record them.  A Calibre-made book carries four of these, which is
+    five epubcheck RSC-005 errors -- one creator element carries two.
+
+    `opf:event` is the one that needs care.  Calibre stamps it on a *second*
+    dc:date (`<dc:date opf:event="modification">`), and epubcheck rejects the
+    attribute as RSC-005 -- and then rejects the element that carries it too,
+    so one stray attribute costs two errors.  The date itself is kept: only the
+    spelling of what it means is pre-EPUB 3.
 
     Returns (text, reasons).
     """
     refines = []
+    dropped = []
     named = [0]
 
     def convert(m):
@@ -282,16 +309,18 @@ def demote_opf2_attributes(s):
         if not found:
             return m.group(0)
         attrs = OPF2_ATTR.sub('', attrs)
-        idm = re.search(r'\bid="([^"]*)"', attrs)
-        if idm:
-            ident = idm.group(1)
-        else:
-            named[0] += 1
-            ident = f'opf2-{tag}-{named[0]}'
-            attrs = attrs.rstrip() + f' id="{ident}"'
-        for name, value in found:
-            if name == 'scheme':
-                continue
+        kept = [(n, v) for n, v in found if n in OPF2_REFINABLE]
+        dropped.extend(n for n, _v in found if n not in OPF2_REFINABLE)
+        ident = None
+        if kept:                       # only a refined element needs the id
+            idm = re.search(r'\bid="([^"]*)"', attrs)
+            if idm:
+                ident = idm.group(1)
+            else:
+                named[0] += 1
+                ident = f'opf2-{tag}-{named[0]}'
+                attrs = attrs.rstrip() + f' id="{ident}"'
+        for name, value in kept:
             if name == 'role':
                 refines.append(f'    <meta refines="#{ident}" '
                                f'property="role" scheme="marc:relators"'
@@ -302,12 +331,16 @@ def demote_opf2_attributes(s):
         return f'<dc:{tag}{attrs}{selfclose}>'
 
     out = DC_OPEN.sub(convert, s)
-    if not refines:
-        return s, []
-    out = re.sub(r'(</metadata\s*>)',
-                 lambda m: '\n'.join(refines) + '\n' + m.group(1),
-                 out, count=1)
-    return out, ['EPUB 2 opf: attribute(s) moved into <meta refines>']
+    reasons = []
+    if refines:
+        out = re.sub(r'(</metadata\s*>)',
+                     lambda m: '\n'.join(refines) + '\n' + m.group(1),
+                     out, count=1)
+        reasons.append('EPUB 2 opf: attribute(s) moved into <meta refines>')
+    if dropped:
+        reasons.append('EPUB 2 opf: attribute(s) with no EPUB 3 equivalent '
+                       'dropped: ' + ', '.join(sorted(set(dropped))))
+    return out, reasons
 
 
 def strip_itemref_properties(s):
@@ -330,6 +363,27 @@ def strip_itemref_properties(s):
         return s, []
     return out, ['undefined itemref properties token(s) removed: '
                  + ', '.join(sorted(set(dropped)))]
+
+
+# EPUB 3 allows exactly ONE dc:date element (epubcheck RSC-005 on the second).
+# A Calibre EPUB 2 book carries two: the publication date and a second one
+# meaning "modification", which `opf:event` used to say and which EPUB 3 says
+# with the dcterms:modified this upgrade adds anyway.  So the extra element is
+# removed, not merged, and the first -- the publication date -- is the one kept.
+DATE_ELEMENT = re.compile(r'(?is)<dc:date\b[^>]*>.*?</dc:date\s*>'
+                          r'|<dc:date\b[^>]*/\s*>')
+
+
+def keep_one_date(s):
+    """Leave the package with a single dc:date.  Returns (text, dropped)."""
+    seen = [0]
+
+    def fix(m):
+        seen[0] += 1
+        return m.group(0) if seen[0] == 1 else ''
+
+    out = DATE_ELEMENT.sub(fix, s)
+    return out, max(0, seen[0] - 1)
 
 
 def package_identifier(opf_text):
@@ -366,6 +420,11 @@ def upgrade_opf(s, urn, opf_dir, referenced, names, lang, cover,
 
     s, opf2_reasons = demote_opf2_attributes(s)
     reasons += opf2_reasons
+
+    s, date_dropped = keep_one_date(s)
+    if date_dropped:
+        reasons.append(f'{date_dropped} extra dc:date element(s) dropped '
+                       f'(EPUB 3 allows one)')
 
     # a unique-identifier must resolve to a dc:identifier that has a value
     uid_ref = re.search(r'<package\b[^>]*\bunique-identifier\s*=\s*"([^"]+)"', s)
@@ -613,10 +672,74 @@ def play_orders(ncx_text, ncx_dir):
     return [seen.setdefault(key, len(seen) + 1) for key in keys]
 
 
-def repair_ncx(raw, ident, ncx_dir):
-    """Bring the NCX into line with the package: its identity and its order.
+# an XML Name, which is what an `id` value has to be
+XML_NAME = re.compile(r'^[A-Za-z_][\w.\-]*$')
+NCX_ID = re.compile(r'''(\sid\s*=\s*)(?:"([^"]*)"|'([^']*)')''')
 
-    Two independent repairs, either of which may be a no-op:
+
+def fix_ncx_ids(text):
+    """Give every NCX element an id that is an XML name, and a unique one.
+
+    A converter that numbers its navPoints "001", "002" ... writes an `id` that
+    starts with a digit, which no XML name may do; epubcheck rejects every one
+    of them as RSC-005 ("value of attribute id is invalid").  Nothing
+    references a navPoint's id -- reading order is `playOrder`, a target is
+    `content/@src` -- so they are renamed rather than dropped: a fresh `npN`
+    for an id that cannot stay, and the first holder keeps its name when two
+    navPoints share one.
+
+    Returns (text, renamed-count).
+    """
+    used, fresh = set(), [0]
+    renamed = [0]
+
+    def fix_attr(m):
+        prefix, value = m.group(1), m.group(2) if m.group(2) is not None \
+            else m.group(3)
+        quote = '"' if m.group(2) is not None else "'"
+        if XML_NAME.match(value) and value not in used:
+            used.add(value)
+            return m.group(0)
+        while True:
+            fresh[0] += 1
+            candidate = f'np{fresh[0]}'
+            if candidate not in used:
+                break
+        used.add(candidate)
+        renamed[0] += 1
+        return f'{prefix}{quote}{candidate}{quote}'
+
+    out = NCX_ID.sub(fix_attr, text)
+    return out, renamed[0]
+
+
+def set_ncx_uid(text, ident):
+    """Stamp the package identifier on the NCX's dtb:uid meta, in any order.
+
+    Returns (text, whether anything was rewritten).
+    """
+    changed = [0]
+
+    def fix(m):
+        tag = m.group(0)
+        names = {a.split('=', 1)[0].strip().lower()
+                 for a in META_ATTR.findall(tag)}
+        if 'name' not in names or 'content' not in names:
+            return tag
+        if re.search(r'''\bname\s*=\s*["']dtb:uid["']''', tag, re.I) is None:
+            return tag
+        new = CONTENT_ATTR.sub(lambda c: c.group(1) + f'"{ident}"', tag, count=1)
+        if new != tag:
+            changed[0] += 1
+        return new
+
+    return META_TAG.sub(fix, text), bool(changed[0])
+
+
+def repair_ncx(raw, ident, ncx_dir):
+    """Bring the NCX into line with the package: identity, order and ids.
+
+    Three independent repairs, any of which may be a no-op:
 
     * the NCX has to carry the package's own identity -- an NCX naming a
       different uuid is NCX-001.  Left alone when it names no identity at all:
@@ -624,13 +747,19 @@ def repair_ncx(raw, ident, ncx_dir):
       caller did not ask for;
     * navPoints have to agree on playOrder per reference and number 1..n with
       no gaps (see play_orders).  An NCX that already does comes back
-      byte-for-byte.
+      byte-for-byte;
+    * a navPoint `id` has to be an XML name and has to be unique (see
+      fix_ncx_ids).
 
-    Returns the NCX bytes.
+    Returns (NCX bytes, reasons).
     """
+    reasons = []
     text = raw.decode('utf-8')
-    if NCX_UID.search(text):
-        text = NCX_UID.sub(lambda m: m.group(1) + ident + m.group(2), text)
+    text, _uid_fixed = set_ncx_uid(text, ident)
+
+    text, renamed = fix_ncx_ids(text)
+    if renamed:
+        reasons.append(f'{renamed} NCX id(s) that were not XML names renamed')
 
     orders = play_orders(text, ncx_dir)
     if orders:
@@ -650,7 +779,69 @@ def repair_ncx(raw, ident, ncx_dir):
                 f' playOrder="{order}"', attrs, count=1) + tail
 
         text = NAVPOINT_OPEN.sub(renumber, text)
-    return text.encode('utf-8')
+    if reasons or text.encode('utf-8') != raw:
+        reasons.insert(0, 'NCX brought into line with the package')
+    return text.encode('utf-8'), reasons
+
+
+# --------------------------------------------------------------------------
+# links that point at an anchor the book does not carry
+# --------------------------------------------------------------------------
+
+HREF_ATTR = re.compile(r'''(\shref\s*=\s*)(?:"([^"]*)"|'([^']*)')''')
+ANCHOR_DEF = re.compile(r'''\s(?:id|name)\s*=\s*(?:"([^"]*)"|'([^']*)')''')
+EXTERNAL_HREF = re.compile(r'^(?:[A-Za-z][A-Za-z0-9+.\-]*:|//)')
+
+
+def anchors(blob):
+    """Every fragment target a document defines: its ids and <a name=>s."""
+    raw = blob.decode('utf-8', 'replace')
+    found = set()
+    for m in ANCHOR_DEF.finditer(raw):
+        found.add(m.group(1) if m.group(1) is not None else m.group(2))
+    return found
+
+
+def repair_fragments(blob, path, targets, names):
+    """Drop the fragment of a link whose anchor the target document lacks.
+
+    A converted book keeps footnote references that point at an anchor the
+    notes document does not define -- `_031.htm#chap3_132` for a notes file
+    whose ids stop at `chap3_13`.  epubcheck calls that RSC-012 and refuses the
+    book.  The reference itself is real (it says "note 132"), so the link is
+    kept and only the dead `#fragment` goes: the reader still lands on the
+    notes document.  Nothing else is touched -- a link to a file the book does
+    not carry at all is a different defect, repaired elsewhere.
+
+    Returns (blob, list of the fragments dropped).
+    """
+    from split_epubs import resolve
+
+    try:
+        raw = blob.decode('utf-8')
+    except UnicodeDecodeError:
+        return blob, []
+    dropped = []
+
+    def fix(m):
+        prefix = m.group(1)
+        value = m.group(2) if m.group(2) is not None else m.group(3)
+        quote = '"' if m.group(2) is not None else "'"
+        if EXTERNAL_HREF.match(value) or '#' not in value:
+            return m.group(0)
+        target, _, frag = value.partition('#')
+        if not frag:
+            return m.group(0)
+        resolved = path if not target else resolve(path, target)
+        if resolved not in names:
+            return m.group(0)                   # dead file: not this repair
+        if frag in targets.get(resolved, ()):
+            return m.group(0)
+        dropped.append(frag)
+        return f'{prefix}{quote}{target}{quote}'
+
+    out = HREF_ATTR.sub(fix, raw)
+    return (out.encode('utf-8') if dropped else blob), dropped
 
 
 # --------------------------------------------------------------------------
@@ -715,9 +906,35 @@ def analyse(src, cover_bytes=None, cover_name=None):
     ncx_name = next((n for n in names if n.lower().endswith('.ncx')), None)
     ncx_dir = posixpath.dirname(ncx_name) if ncx_name else opf_dir
 
+    # The navigation tree, folded once and rendered for both the EPUB 3 nav
+    # document and the legacy NCX, so the two agree.  A converter's NCX often
+    # lists a chapter twice -- its section marker and its title, both opening
+    # the same page -- so the same-target runs are collapsed before either is
+    # emitted.  toc_folded records whether the collapse changed anything, so a
+    # book with no doubled entries keeps its own NCX and is never re-emitted.
+    toc_tree = None
+    toc_folded = False
+    if ncx_name:
+        base = finalise_toc(ncx_tree(next(d for _i, n, d in entries
+                                          if n == ncx_name),
+                                     ncx_dir, nameset), opf_dir)
+        toc_tree = collapse_same_target(base)
+        toc_folded = render_nav(base) != render_nav(toc_tree)
+
+    # The book's own navigation document is the one file validated against the
+    # nav grammar rather than the content grammar (see drop_nav_aria_attrs).
+    nav_docs = {posixpath.normpath(posixpath.join(opf_dir, a['href']))
+                for a in (kept or [])
+                if 'nav' in (a.get('properties') or '').split()
+                and a.get('href')}
+
     patched = {}
     retitled = 0
     bad_attrs = []
+    dupes = []
+    aria = []
+    touched = 0
+    docs = []
     for info, name, data in entries:
         if name == opf_name:
             patched[name] = new_opf.encode('utf-8')
@@ -736,32 +953,74 @@ def analyse(src, cover_bytes=None, cover_name=None):
                 reasons.append(f'dead reference(s) removed from {name}')
             patched[name] = fixed
         elif name.lower().endswith('.ncx'):
-            fixed = repair_ncx(data, ident, ncx_dir)
-            if fixed != data:
-                reasons.append('NCX brought into line with the package')
+            if toc_folded:
+                fixed = ncx_document(toc_tree, ident, book_title, lang)\
+                    .encode('utf-8')
+                reasons.append('NCX folded to agree with the navigation document')
+            else:
+                fixed, ncx_reasons = repair_ncx(data, ident, ncx_dir)
+                reasons += ncx_reasons
             patched[name] = fixed
         elif name.lower().endswith(('.html', '.xhtml', '.htm')):
-            fixed = normalise_html(repair_markup(data), name, nameset)
+            fixed = normalise_html(repair_markup(data), name, nameset,
+                                   nav=name in nav_docs)
             if empty_title(fixed):
                 stem = posixpath.splitext(posixpath.basename(name))[0]
                 fixed = fill_empty_title(fixed, book_title or stem)
                 retitled += 1
             bad_attrs += invalid_data_attrs(data)
+            dupes += duplicate_ids(data)
+            if name in nav_docs:
+                aria += nav_aria_attrs(data)
+            if fixed != data:
+                touched += 1
+            docs.append((info, name, data, fixed))
             patched[name] = fixed
+
+    # A link whose `#fragment` names no anchor in the target document is
+    # epubcheck RSC-012.  The repair needs the whole book -- the anchor lives in
+    # another document -- so it runs once every document has been normalised
+    # and its ids are final.
+    targets = {name: anchors(fixed) for _i, name, _d, fixed in docs}
+    dead_frags = []
+    for info, name, data, fixed in docs:
+        repaired, dropped = repair_fragments(fixed, name, targets, nameset)
+        dead_frags += dropped
+        patched[name] = repaired
 
     if retitled:
         reasons.append(f'{retitled} empty <title> element(s) filled')
     if bad_attrs:
         reasons.append('invalid custom data attribute(s) dropped: '
                        + ', '.join(sorted(set(bad_attrs))))
+    if dupes:
+        reasons.append(f'{len(dupes)} duplicate id(s) renamed: '
+                       + ', '.join(sorted(set(dupes))[:6]))
+    if aria:
+        reasons.append('ARIA attribute(s) a navigation document forbids '
+                       'dropped: ' + ', '.join(sorted(set(aria))))
+    if dead_frags:
+        reasons.append(f'{len(dead_frags)} link(s) to an anchor the book does '
+                       f'not define: fragment dropped '
+                       f'({", ".join(sorted(set(dead_frags))[:6])})')
+    if touched and not (retitled or bad_attrs or dupes or aria or dead_frags):
+        # nothing named above explains it, but normalise_html did change these
+        # documents.  Saying so keeps the "already EPUB 3, copied in" path
+        # honest: that path must only ever mean "not one byte changed".
+        reasons.append(f'{touched} content document(s) normalised')
 
-    if ncx_name and not any(n == posixpath.join(opf_dir, 'nav.xhtml')
-                            for n in names):
-        tree = finalise_toc(ncx_tree(next(d for _i, n, d in entries
-                                          if n == ncx_name),
-                                     ncx_dir, nameset), opf_dir)
-        patched[posixpath.join(opf_dir, 'nav.xhtml')] = (
-            NAV_DOC.format(lang=lang, body=render_nav(tree))).encode('utf-8')
+    nav_path = posixpath.join(opf_dir, 'nav.xhtml')
+    if toc_tree is not None and nav_path not in names:
+        # The generated nav carries the NCX's own targets, so it can inherit a
+        # dead fragment the NCX had; the same repair applies to it.
+        generated, dropped = repair_fragments(
+            NAV_DOC.format(lang=lang, heading=nav_heading(lang),
+                           body=render_nav(toc_tree)).encode('utf-8'),
+            nav_path, targets, nameset)
+        if dropped:
+            reasons.append(f'{len(dropped)} navigation link(s) to an anchor '
+                           f'the book does not define: fragment dropped')
+        patched[nav_path] = generated
 
     if cover_bytes is not None and cover is not None:
         patched[cover] = cover_bytes
@@ -801,10 +1060,40 @@ def write_epub(dst, entries, patched):
 # driver
 # --------------------------------------------------------------------------
 
+DC_TITLE = re.compile(r'(?is)<dc:title\b[^>]*>(.*?)</dc:title\s*>')
+
+
+def dc_title(path):
+    """The book's own dc:title, or '' if the archive will not give it up."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            opf = next((n for n in z.namelist()
+                        if n.lower().endswith('.opf')), None)
+            if opf is None:
+                return ''
+            text = z.read(opf).decode('utf-8', 'replace')
+    except (zipfile.BadZipFile, OSError, KeyError):
+        return ''
+    m = DC_TITLE.search(text)
+    return re.sub(r'\s+', ' ', m.group(1)).strip() if m else ''
+
+
 def is_bundle(path):
-    """True for a file the splitter owns -- `correct` must leave it alone."""
+    """True for a file the splitter owns -- `correct` must leave it alone.
+
+    The name substring is not enough on its own.  A split book is named
+    "<author> - <title>" and a bundle key is usually the author's own name, so
+    every book that came out of 崔曼莉's, 铁凝's or 德波顿's set answers the
+    substring test and would be skipped for ever.  A bundle ALSO carries the set
+    title its entry names, which no single volume out of it does, so that title
+    is the second half of the identity test -- which is why an entry's
+    `set_title` has to be a substring of the bundle's own dc:title.
+    """
     base = os.path.basename(path)
-    return any(cfg['match'] in base for cfg in BUNDLES)
+    for cfg in BUNDLES:
+        if cfg['match'] in base and cfg['set_title'] in dc_title(path):
+            return True
+    return False
 
 
 def main():

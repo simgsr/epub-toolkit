@@ -17,8 +17,8 @@ export EPUB_SPLIT_DIR  := $(SPLIT)
 export EPUB_REPORT_DIR := $(REPORTS)
 
 .DEFAULT_GOAL := help
-.PHONY: help plan split-epub correct verify content epubcheck summarise \
-        check check-lite run clean clean-all
+.PHONY: help plan split-epub correct names names-fix verify content epubcheck \
+        summarise check check-lite run clean clean-all
 
 help:                ## show this list
 	@echo 'EPUB toolkit.  Drop EPUBs in this folder, then:'
@@ -28,8 +28,10 @@ help:                ## show this list
 	@echo '  make plan        show the split plan for the bundles here, write nothing'
 	@echo '  make split-epub  split each multi-book bundle into $(SPLIT)/'
 	@echo '  make correct     repair + upgrade top-level EPUBs and $(SPLIT)/ to EPUB 3'
-	@echo '  make check       verify + content + epubcheck + summarise'
+	@echo '  make check       names + verify + content + epubcheck + summarise'
 	@echo
+	@echo '  make names       check every EPUB filename is "Author - Book name"'
+	@echo '  make names-fix   rename the ones that are not'
 	@echo '  make verify      structural checks on $(SPLIT)/*.epub'
 	@echo '  make content     prove no text was lost (needs the source bundle here)'
 	@echo '  make epubcheck   one JSON report per book into $(REPORTS)/'
@@ -51,6 +53,12 @@ split-epub:          ## split each multi-book bundle into $(SPLIT)/
 correct:             ## repair + upgrade top-level EPUBs and $(SPLIT)/ to EPUB 3
 	$(PYTHON) normalise_epub.py --out $(SPLIT)
 
+names:               ## check every EPUB is named "Author - Book name"
+	$(PYTHON) check_filenames.py
+
+names-fix:           ## rename the EPUBs that break the filename convention
+	$(PYTHON) check_filenames.py --fix
+
 verify:              ## structural checks on $(SPLIT)/*.epub
 	$(PYTHON) verify_epubs.py
 
@@ -70,8 +78,8 @@ epubcheck:           ## one JSON report per book into $(REPORTS)/
 summarise:           ## tally $(REPORTS)/*.json
 	$(PYTHON) summarise_epubcheck.py
 
-check: verify content epubcheck summarise   ## the full quality gate
-check-lite: verify content                  ## skip epubcheck
+check: names verify content epubcheck summarise   ## the full quality gate
+check-lite: names verify content                  ## skip epubcheck
 
 # recursive make gives a guaranteed serial order that aborts on the first
 # non-zero exit, whatever -j says

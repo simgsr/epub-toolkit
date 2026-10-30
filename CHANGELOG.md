@@ -7,6 +7,26 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `check_filenames.py`: holds every EPUB to one filename convention --
+  `Author - Book name.epub`, or `Author - Series 01 Book name.epub` when the
+  book belongs to a series.  The author, series and number are read from the
+  book's own package document rather than guessed from the name, so a file
+  called `The Russian Revolution - A New History (2017) (Sean McMeekin)
+  (z-library.sk, 1lib.sk, z-lib.sk).epub` is reported for the author buried at
+  the end and for the download-site tag.  `--fix` repairs the name it was given
+  -- the author moves to the front, the site tag goes, the whitespace is
+  collapsed -- and never replaces it with the metadata title, which is usually
+  shorter than what the name says.  `make names` gates the pipeline on it;
+  `make names-fix` applies it.  A multi-book bundle is reported and skipped: it
+  is a source the splitter finds by its `match` substring, so holding it to the
+  library convention would fail the gate on every freshly downloaded bundle
+  before anything had been split.  A series takes part in the name only when the
+  book declares a NUMBER for it -- "Mistborn 01" is what sorts a shelf, while a
+  publisher's set such as 阿兰·德波顿作品全集 carries no `group-position` and
+  would only repeat the author inside the book name.
+
 ### Fixed
 
 - `verify_epubs.py` rejected a fragment-only nav link such as `href="#toc"`,

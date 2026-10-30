@@ -31,7 +31,9 @@ make run          # split, then correct, then the whole quality gate
 make plan         # just show what the splitter would do
 make split-epub   # split the bundles here into split/
 make correct      # repair + upgrade to EPUB 3
-make check        # verify + content + epubcheck + summarise
+make check        # names + verify + content + epubcheck + summarise
+make names        # check every EPUB is named the way this folder expects
+make names-fix    # rename the ones that are not
 make clean        # drop reports and caches (split/*.epub is left alone)
 ```
 
@@ -64,6 +66,7 @@ make SPLIT=books PYTHON=python3.14 run
 | `verify_epubs.py` | structural checks: container/OPF, manifest↔archive agreement, spine, navigation links and fragment targets, cover, no leaked set-level pages |
 | `content_check.py` | prove no text was lost or invented, comparing each output document against the source bundle it came from |
 | `summarise_epubcheck.py` | roll the per-book epubcheck JSON reports into one tally |
+| `check_filenames.py` | hold every name to the convention below, and rename the ones that break it |
 | `epub_paths.py` | the shared directory constants (see below) |
 
 `split_epubs.py` carries a `BUNDLES` table of per-bundle configuration; its
@@ -72,6 +75,18 @@ split — add one, using the 徐皓峰作品集 entry as the worked example.
 
 ## Conventions
 
+- **Every file is named `<Author> - <Book name>.epub`.** A book that belongs to a
+  series carries the series and its number between the author and the name —
+  `<Author> - <Series> 01 <Book name>.epub` — because that number is what makes a
+  shelf sort in reading order. `make names` checks the books in this folder and
+  in `split/`, reading the author, series and number from each book's own package
+  document rather than trusting the filename; `make names-fix` renames the ones
+  that break it (an author left at the end in parentheses, a `(z-library.sk, …)`
+  tag, runs of whitespace). `make check` runs `names` first, so a badly named
+  book fails the gate. A multi-book **bundle** is not held to this: it is a
+  source the splitter finds by its `match` substring and is consumed rather than
+  kept, so `names` reports it as skipped and the books that come out of it are
+  the ones checked, in `split/`.
 - **Outputs go to `split/`.** That is the only place books are written, so
   `verify`/`content`/`epubcheck` have a single directory to check and you have a
   single place to collect from.
@@ -105,6 +120,7 @@ normalise_epub.py     repair + upgrade to EPUB 3
 verify_epubs.py       structural checks
 content_check.py      no text lost or invented
 summarise_epubcheck.py  tally epubcheck reports
+check_filenames.py    "Author - Book name" naming, and the repair for it
 pyproject.toml        metadata only: requires-python, no dependencies
 ```
 
